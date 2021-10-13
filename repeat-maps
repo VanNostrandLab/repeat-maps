@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+source /storage/vannostrand/software/eclip/venv/environment.sh
+
+if [[ "$*" == *--debug* ]]; then
+    export PATH=/storage/vannostrand/software/repeat-maps/source:$PATH
+else
+    export PATH=/storage/vannostrand/software/repeat-maps/venv/bin:$PATH
+fi
+
+repeat-maps.py $@
