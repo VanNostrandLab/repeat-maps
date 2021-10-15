@@ -19,7 +19,6 @@ import gzip
 import sys
 import time
 import subprocess
-
 import datetime
 import tempfile
 import shutil
@@ -48,7 +47,7 @@ parser.add_argument('--bam', required=True, nargs='+', type=file_path,
                     help='path to genomic mapping bam file(s) corresponding to fastq file(s).')
 parser.add_argument('--dataset', nargs='+', help='Name of the each dataset.')
 parser.add_argument('--species', default='hg19', choices=('hg19', 'hg38'),
-                    help="Short name for species, e.g. hg19, hg38, mm10, ..., default: hg19 .")
+                    help="Short name for species, e.g. hg19, hg38, mm10, ..., default: hg19.")
 parser.add_argument('--database', help='The basename of the bowtie index files, default: auto populate for species.')
 parser.add_argument('--outdir',
                     help="Path to the output directory. Default to the current work directory and if the specified "
@@ -81,35 +80,53 @@ if len(options.fastq) != len(options.bam):
     logger.error(f'Number of FASTQ files does not match the number of BAM files.')
     sys.exit(1)
     
-F1_TO_FASTQ = {fastq.split(':')[0]: fastq if ':' in fastq else f'{fastq}:' for fastq in options.fastq}
-datasets = options.dataset if options.dataset else [os.path.basename(fastq).replace('.fastq.gz', '')
-                                                    for fastq in F1_TO_FASTQ]
-if len(datasets) != len(options.fastq):
+R1 = [fastq.split(':')[0] for fastq in options.fastq]
+R1_TO_FASTQ = {fastq.split(':')[0]: fastq if ':' in fastq else f'{fastq}:' for fastq in options.fastq}
+DATASETS = options.dataset if options.dataset else [os.path.basename(fastq).replace('.fastq.gz', '')
+                                                    for fastq in R1_TO_FASTQ]
+if len(DATASETS) != len(options.fastq):
     logger.error(f'Number of FASTQ files does not match the number of dataset names.')
     sys.exit(1)
-
-FASTQ_TO_SAM = {fastq: f'{ds}.repetitive.elements.sam' for fastq, ds in zip(F1_TO_FASTQ, datasets)}
-DATASET_TO_SAM = {dataset: (f'{dataset}.repetitive.elements.sam', bam)
-                  for dataset, fastq, bam in zip(datasets, F1_TO_FASTQ, options.bam)}
-DATA_TYPES = {dataset: 'PE' if ':' in fastq else 'SE' for dataset, fastq in zip(datasets, options.fastq)}
-SAM_TO_BAM = {f'{dataset}.repetitive.elements.{x}{y}.sam': os.path.basename(bam).replace('.bam', f'.genome.{x}{y}.sam')
-              for dataset in datasets for x in 'ATGCN' for y in 'ATGCN' for bam in options.bam}
-BAM_TO_SAM = {v: k for k, v in SAM_TO_BAM.items()}
-GENOME_BAM = {os.path.basename(bam).replace('.bam', f'.genome.{x}{y}.sam'): bam
-              for bam in options.bam for x in 'ATGCN' for y in 'ATGCN'}
-dbs = {'hg19': '/storage/vannostrand/reference_data/repeat-map-hg19/bowtie2_index/repeat.elements',
+    
+FASTQ_TO_LINK = {r1: f'{dataset}.r1.fastq.gz' for r1, dataset in zip(R1_TO_FASTQ, DATASETS)}
+FASTQ_TO_BAM = {r1: bam for r1, bam in zip(R1_TO_FASTQ, options.bam)}
+DATASET_TO_TYPES = {dataset: 'PE' if ':' in fastq else 'SE' for dataset, fastq in zip(DATASETS, options.fastq)}
+DBS = {'hg19': '/storage/vannostrand/reference_data/repeat-map-hg19/bowtie2_index/repeat.elements',
        'hg38': '/storage/vannostrand/reference_data/repeat-family-mapping-grch38/bowtie2_index/repeat.elements'}
-if options.species not in dbs:
-    logger.error(f'Invalid species or species has not been implemented yest.')
-    sys.exit(1)
-DB = options.database if options.database else dbs[options.species]
+DB = options.database if options.database else DBS[options.species]
 setattr(options, 'database', DB)
 
 
-@task(inputs=options.fastq, outputs=lambda i: FASTQ_TO_SAM[i])
+def _link(src, dst):
+    if src:
+        if os.path.exists(src):
+            if os.path.exists(dst):
+                if os.path.islink(dst):
+                    logger.debug(f'Link {dst} for source {src} already exists.')
+                else:
+                    logger.warning(f'Both link {dst} and source {src} point to the same file.')
+            else:
+                os.symlink(src, dst)
+        else:
+            logger.error(f'File {src} does not exist.')
+            sys.exit(1)
+        
+
+@task(inputs=list(FASTQ_TO_LINK.keys()), outputs=lambda i: FASTQ_TO_LINK[i])
+def soft_link(fastq, link):
+    (fastq1, fastq2), bam = R1_TO_FASTQ[fastq].split(':'), FASTQ_TO_BAM[fastq]
+    dataset = link.replace('.r1.fastq.gz', '')
+    _link(fastq1, os.path.join(options.outdir, link))
+    _link(fastq2, os.path.join(options.outdir, f'{dataset}.r2.fastq.gz'))
+    _link(bam, os.path.join(options.outdir, f'{dataset}.genome.bam'))
+    return link
+
+
+@task(inputs=soft_link, outputs=lambda i: i.replace('.r1.fastq.gz', '.repetitive.elements.sam'))
 def bowtie_family_map(fastq, sam):
-    fastq1, fastq2 = F1_TO_FASTQ[fastq].split(':')
-    fastq = f'{fastq1}:{fastq2}' if fastq2 else fastq1
+    fastq2 = fastq.replace('.r1.fastq.gz', '.r2.fastq.gz')
+    if os.path.exists(fastq2):
+        fastq = f'{fastq}:{fastq2}'
     cmd = f'bowtie_family_map.pl {fastq} {DB} {sam} {options.species} {options.cpus}'
     cmder.run(cmd, msg='Mapping and annotating repeat elements ...')
     
@@ -122,40 +139,43 @@ def split_bam(bam, flag='SE', out=''):
     
 @task(inputs=bowtie_family_map, outputs=lambda i: i.replace('.sam', '.NN.sam'))
 def split_repeat_bam(sam, out):
-    split_bam(sam, flag=DATA_TYPES[out.replace('.repetitive.elements.NN.sam', '')])
+    split_bam(sam, flag=DATASET_TO_TYPES[out.replace('.repetitive.elements.NN.sam', '')])
 
 
-@task(inputs=[], outputs=list(GENOME_BAM.keys())[:1], parent=split_repeat_bam)
+@task(inputs=[], outputs=[f'{dataset}.genome.NN.sam' for dataset in DATASETS], parent=split_repeat_bam)
 def split_genome_bam(inputs, out):
-    bam = GENOME_BAM[out]
+    bam = out.replace('.genome.NN.sam', '.genome.bam')
     flag = cmder.run(f'samtools view -c -f 1 {bam}').stdout.read().strip()
     flag = 'SE' if flag == '0' else 'PE'
-    split_bam(bam, flag=flag, out=os.path.basename(bam).replace('.bam', '.genome'))
+    split_bam(bam, flag=flag, out=out.replace('.NN.sam', ''))
 
 
 @task(inputs=[], parent=split_genome_bam, cpus=options.cpus,
-      outputs=[k.replace('.repetitive.elements', '.repetitive.elements.combine.with.unique.map.dedup')
-               for k in SAM_TO_BAM])
+      outputs=[f'{dataset}.repetitive.elements.combine.with.unique.map.dedup.{x}{y}.sam'
+               for dataset in DATASETS for x in 'ATGCN' for y in 'ATGCN'])
 def dedup(bam, out):
-    sam = out.replace('.combine.with.unique.map.dedup', '')
-    flag = DATA_TYPES[sam.split('.repetitive.elements.')[0]]
-    bam = SAM_TO_BAM[sam]
-    cmder.run(f'duplicate_removal.pl {sam} {bam} {flag} {options.species}',
-              msg=f'Deduplicating {sam} ...')
+    sam = out.replace('.repetitive.elements.combine.with.unique.map.dedup.', '.repetitive.elements.')
+    bam = out.replace('.repetitive.elements.combine.with.unique.map.dedup.', '.genome.')
+    flag = DATASET_TO_TYPES[out.split('.repetitive.elements.')[0]]
+    cmder.run(f'duplicate_removal.pl {sam} {bam} {flag} {options.species}', msg=f'Deduplicating {sam} ...')
 
 
 @task(inputs=[], parent=dedup,
-      outputs=[f'{dataset}.repetitive.elements.combine.with.unique.map.count.tsv' for dataset in datasets])
+      outputs=[f'{dataset}.repetitive.elements.combine.with.unique.map.count.tsv' for dataset in DATASETS])
 def merge_result(inputs, out):
     pattern = out.replace('.count.tsv', '.dedup*sam')
     tsv = out.replace('.count.tsv', '.tsv.gz')
     cmder.run(f'cat {pattern} | pigz -p {options.cpus} > {tsv}')
-    cmder.run(f'merge_sam.pl {out} *.count.txt')
+    cmder.run(f'merge_sam.pl {out} *.[ATGCN][ATGCN].count.txt')
 
 
-def cleanup():
+@task(inputs=merge_result, outputs=lambda i: i.replace('.map.count.tsv', '.map.count.tsv.gz'))
+def cleanup(tsv, out):
     cmder.run(f'rm *.repetitive.elements.sam')
     cmder.run('rm *.[ATGCN][ATGCN].sam *.[ATGCN][ATGCN].count.txt* failed_jobs*')
+    _ = [os.unlink(p) for p in glob.iglob('*.fastq.gz') if os.path.islink(p)]
+    _ = [os.unlink(p) for p in glob.iglob('*.bam') if os.path.islink(p)]
+    cmder.run(f'pigz -p {options.cpus} {tsv}')
 
 
 def schedule():
@@ -254,9 +274,6 @@ def main():
     if options.scheduler == 'local':
         flow = Flow('repeat-maps', description=__doc__.strip())
         flow.run(dry_run=options.dry_run, cpus=options.cpus)
-        logger.info('Cleaning up and finalizing ...')
-        cleanup()
-        logger.info('Mission accomplished!')
     else:
         schedule()
 
