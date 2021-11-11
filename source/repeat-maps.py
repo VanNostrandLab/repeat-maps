@@ -131,13 +131,13 @@ def bowtie_family_map(fastq, sam):
     if os.path.exists(fastq2):
         fastq = f'{fastq}:{fastq2}'
     cmd = f'bowtie_family_map.pl {fastq} {DB} {sam} {options.species} {options.cpus}'
-    cmder.run(cmd, msg='Mapping and annotating repeat elements ...')
+    cmder.run(cmd)
     
     
 def split_bam(bam, flag='SE', out=''):
     exes = {'SE': 'split_bam_se.pl', 'PE': 'split_bam_se.pl'}
     out = f' {out}' if out else ''
-    cmder.run(f'{exes[flag]} {bam}{out}', msg=f'Splitting {bam} ...')
+    cmder.run(f'{exes[flag]} {bam}{out}')
     
     
 @task(inputs=bowtie_family_map, outputs=lambda i: i.replace('.sam', '.NN.sam'))
@@ -145,7 +145,8 @@ def split_repeat_bam(sam, out):
     split_bam(sam, flag=DATASET_TO_TYPES[out.replace('.repetitive.elements.NN.sam', '')])
 
 
-@task(inputs=[], outputs=[f'{dataset}.genome.NN.sam' for dataset in DATASETS], parent=split_repeat_bam)
+@task(inputs=[], outputs=[f'{dataset}.genome.NN.sam' for dataset in DATASETS],
+      parent=split_repeat_bam, cpus=options.cpus)
 def split_genome_bam(inputs, out):
     bam = out.replace('.genome.NN.sam', '.genome.bam')
     flag = cmder.run(f'samtools view -c -f 1 {bam}').stdout.read().strip()
@@ -160,7 +161,7 @@ def dedup(bam, out):
     sam = out.replace('.repetitive.elements.combine.with.unique.map.dedup.', '.repetitive.elements.')
     bam = out.replace('.repetitive.elements.combine.with.unique.map.dedup.', '.genome.')
     flag = DATASET_TO_TYPES[out.split('.repetitive.elements.')[0]]
-    cmder.run(f'duplicate_removal.pl {sam} {bam} {flag} {options.species}', msg=f'Deduplicating {sam} ...')
+    cmder.run(f'duplicate_removal.pl {sam} {bam} {flag} {options.species}')
 
 
 @task(inputs=[], parent=dedup,
