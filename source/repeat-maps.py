@@ -25,6 +25,7 @@ import shutil
 import itertools
 import math
 
+import pandas as pd
 import pysam
 import cmder
 from seqflow import Flow, task, logger
@@ -53,6 +54,8 @@ parser.add_argument('--outdir',
                     help="Path to the output directory. Default to the current work directory and if the specified "
                          "path does not exist, it will try to create it first.",
                     default=os.getcwd())
+parser.add_argument('--summary_html', help='Path to html file that summary will be saved.',
+                    default='repetitive.elements.enrichment.summary.html')
 parser.add_argument('--cpus', type=int, help='Maximum number of CPUs can be used, default: 8.', default=8)
 parser.add_argument('--time', type=int, help='Time (in integer hours) for running your job.', default=4)
 parser.add_argument('--memory', type=int, help='Amount of memory (in GB) for all CPU cores.', default=32)
@@ -161,21 +164,88 @@ def dedup(bam, out):
 
 
 @task(inputs=[], parent=dedup,
-      outputs=[f'{dataset}.repetitive.elements.combine.with.unique.map.count.tsv' for dataset in DATASETS])
+      outputs=[f'{dataset}.repetitive.elements.combine.with.unique.map.count.tsv.gz' for dataset in DATASETS])
 def merge_result(inputs, out):
-    pattern = out.replace('.count.tsv', '.dedup*sam')
-    tsv = out.replace('.count.tsv', '.tsv.gz')
-    cmder.run(f'cat {pattern} | pigz -p {options.cpus} > {tsv}')
-    cmder.run(f'merge_sam.pl {out} *.[ATGCN][ATGCN].count.txt')
+    pattern = out.replace('.count.tsv.gz', '.dedup*sam')
+    map_out = out.replace('.count.tsv.gz', '.tsv.gz')
+    cmder.run(f'cat {pattern} | pigz -p {options.cpus} > {map_out}')
+    tsv = out.replace('.tsv.gz', '.tsv')
+    cmder.run(f'merge_count.pl {tsv} *.[ATGCN][ATGCN].count.txt')
+    cmder.run(f'pigz -p {options.cpus} {tsv}')
+    
+
+TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https:////cdn.datatables.net/1.11.1/css/jquery.dataTables.min.css" rel="stylesheet">
+
+    <title>Repetitive Elements Enrichment Summary</title>
+</head>
+
+<body>
+    <div class="container">
+        <h1 class="py-3">RBP enrichment at repeat families and other multi-copy elements</h1>
+        {table}
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <script src="https://cdn.datatables.net/1.11.1/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/fixedheader/3.2.0/js/dataTables.fixedHeader.min.js"></script>
+    <script src="https://cdn.datatables.net/fixedcolumns/4.0.0/js/dataTables.fixedColumns.min.js"></script>
+    <script>
+        $(document).ready( function () {{
+            $('table.dataframe').DataTable({{
+                paging: false,
+                ordering: false,
+                fixedHeader: true,
+                scrollX: true,
+                scrollY: 400,
+                scrollCollapse: true,
+                fixedColumns: {{left: 1}}
+            }});
+        }} );
+    </script>
+</body>
+</html>
+"""
 
 
-@task(inputs=merge_result, outputs=lambda i: i.replace('.map.count.tsv', '.map.count.tsv.gz'))
+@task(inputs=[], outputs=[options.summary_html], parent=merge_result)
+def summarize(inputs, out):
+    outputs = [f'{dataset}.repetitive.elements.combine.with.unique.map.count.tsv.gz' for dataset in DATASETS]
+    df = pd.DataFrame()
+    for path in outputs:
+        sample = os.path.basename(path).split('.trim.repetitive.')[0]
+        dd = pd.read_csv(path, sep='\t', comment='#', header=None, usecols=[0, 1, 3],
+                         names=['group', 'element', 'percentage'])
+        dd = dd.rename(columns={'percentage': sample})
+        dd = dd[(dd['group'] == 'TOTAL') & (~dd['element'].str.contains('\|'))]
+        dd = dd.drop(columns=['group'])
+        df = dd if df.empty else pd.merge(df, dd, on='element', how='outer')
+    df = df.fillna(0)
+    df[df.select_dtypes(include=['number']).columns] *= 3
+    df.to_csv(out.replace('.html', '.tsv'), index=False, sep='\t', float_format='%.6f')
+    with open(out, 'w') as o:
+        table = df.to_html(index=False, escape=False, float_format='%.4f', justify='center',
+                           classes='dataframe table table-light table-bordered text-center w-100')
+        o.write(TEMPLATE.format(table=table))
+
+
+@task(inputs=[], parent=summarize, outputs=['repetitive.elements.multi.map.delete.tsv.gz'])
 def cleanup(tsv, out):
-    cmder.run(f'rm *.repetitive.elements.sam')
-    cmder.run('rm *.[ATGCN][ATGCN].sam *.[ATGCN][ATGCN].count.txt* failed_jobs*')
+    cmder.run(f'rm *.repetitive.elements.sam || true')
+    cmder.run('rm *.[ATGCN][ATGCN].sam *.[ATGCN][ATGCN].count.txt* failed_jobs* || true')
     _ = [os.unlink(p) for p in glob.iglob('*.fastq.gz') if os.path.islink(p)]
     _ = [os.unlink(p) for p in glob.iglob('*.bam') if os.path.islink(p)]
-    cmder.run(f'pigz -p {options.cpus} {tsv}')
+    cmder.run(f'tail -n +1 *repetitive.elements.bowtie.log > repetitive.elements.bowtie.map.log')
+    cmder.run(f'rm *repetitive.elements.bowtie.log')
+    cmder.run(f'tail -n +1 *.map.delete.tsv | pigz -p {options.cpus} > {out}')
+    cmder.run(f'rm *.map.delete.tsv')
 
 
 def schedule():
